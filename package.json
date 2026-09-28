@@ -1,0 +1,36 @@
+{
+  "name": "arzen-webrtc-sip-gateway",
+  "private": true,
+  "version": "0.1.0",
+  "description": "WebRTC-to-SIP media gateway softphone: browser (WebRTC) <-> Node gateway (werift) <-> Asterisk/Issabel (SIP/UDP + RTP)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n gateway,web -c cyan,magenta \"node --watch server/gateway.ts\" \"vite --config web/vite.config.ts\"",
+    "build": "tsc -p tsconfig.server.json && tsc -p web/tsconfig.json --noEmit && vite build --config web/vite.config.ts",
+    "start": "npm run build && node dist/server/gateway.js",
+    "typecheck": "tsc -p tsconfig.test.json && tsc -p web/tsconfig.json --noEmit",
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "werift": "^0.24.4",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1"
+  }
+}
