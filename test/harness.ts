@@ -7,7 +7,8 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { MediaStreamTrack, RTCPeerConnection, RTCRtpCodecParameters, RtpHeader, RtpPacket } from 'werift';
 import { MediaGateway } from '../server/MediaGateway.ts';
 import { SipUA, type SipAccount } from '../server/sip/SipUA.ts';
-import type { ClientMessage, GatewayStatus, ServerMessage } from '../shared/protocol.ts';
+import type { ClientMessage, GatewayStatus, LiveCall, ServerMessage } from '../shared/protocol.ts';
+import type { Supervisor } from '../server/ami/Supervisor.ts';
 import { PASSWORD, PBX_CERT, startFakePbx, type FakePbx } from './fakePbx.ts';
 
 export const until = <T>(p: Promise<T>, ms: number, what: string): Promise<T> =>
@@ -32,6 +33,11 @@ export interface Harness {
   received: RtpPacket[];
   waitReceived(pred: (p: RtpPacket) => boolean, what: string): Promise<RtpPacket>;
   sendFromBrowser(payload: Buffer, seq: number): void;
+  /** Latest live calls board, and every error message, sent to the browser. */
+  liveCalls: LiveCall[];
+  errors: string[];
+  waitLiveCalls(pred: (calls: LiveCall[]) => boolean, what: string): Promise<LiveCall[]>;
+  waitError(pred: (message: string) => boolean, what: string): Promise<string>;
   close(): Promise<void>;
 }
 
@@ -42,16 +48,17 @@ export interface HarnessOptions {
   srtp?: boolean;
   /** Override the UA's SRTP setting (to test mismatches with the PBX). */
   uaSrtp?: boolean;
+  supervisor?: Supervisor;
 }
 
-export async function setup({ connectBrowser = true, transport = 'udp', srtp = false, uaSrtp = srtp }: HarnessOptions = {}): Promise<Harness> {
+export async function setup({ connectBrowser = true, transport = 'udp', srtp = false, uaSrtp = srtp, supervisor }: HarnessOptions = {}): Promise<Harness> {
   const pbx = await startFakePbx({ transport, srtp });
   const ua = new SipUA();
   const registered = new Promise<void>((resolve) => ua.on('registration', (r) => r.state === 'registered' && resolve()));
   await ua.start(accountFor(pbx, { transport, srtp: uaSrtp }));
   await until(registered, 5000, 'registration');
 
-  const gw = new MediaGateway(ua, { extension: '1001', pbx: `127.0.0.1:${pbx.port}`, transport, encryption: uaSrtp, codecs: ['PCMA', 'PCMU'] });
+  const gw = new MediaGateway(ua, { extension: '1001', pbx: `127.0.0.1:${pbx.port}`, transport, encryption: uaSrtp, codecs: ['PCMA', 'PCMU'], supervisor });
   const server = http.createServer();
   const wss = new WebSocketServer({ server, path: '/ws' });
   wss.on('connection', (ws) => gw.handleSocket(ws));
@@ -63,10 +70,33 @@ export async function setup({ connectBrowser = true, transport = 'udp', srtp = f
   let recvWaiters: Array<{ pred: (p: RtpPacket) => boolean; resolve: (p: RtpPacket) => void }> = [];
   let statusWaiters: Array<{ pred: (s: GatewayStatus) => boolean; resolve: (s: GatewayStatus) => void }> = [];
   let lastStatus: GatewayStatus | null = null;
+  let callWaiters: Array<{ pred: (c: LiveCall[]) => boolean; resolve: (c: LiveCall[]) => void }> = [];
+  let errorWaiters: Array<{ pred: (m: string) => boolean; resolve: (m: string) => void }> = [];
   const btrack = new MediaStreamTrack({ kind: 'audio' });
 
   const h: Harness = {
     pbx, ua, gw, received,
+    liveCalls: [],
+    errors: [],
+    waitLiveCalls: (pred, what) =>
+      until(
+        new Promise((resolve) => {
+          if (pred(h.liveCalls)) resolve(h.liveCalls);
+          else callWaiters.push({ pred, resolve });
+        }),
+        5000,
+        what,
+      ),
+    waitError: (pred, what) =>
+      until(
+        new Promise((resolve) => {
+          const hit = h.errors.find(pred);
+          if (hit) resolve(hit);
+          else errorWaiters.push({ pred, resolve });
+        }),
+        5000,
+        what,
+      ),
     send: (msg) => ws!.send(JSON.stringify(msg)),
     waitStatus: (pred, what) =>
       until(
@@ -106,6 +136,14 @@ export async function setup({ connectBrowser = true, transport = 'udp', srtp = f
     ws!.on('message', (data) => {
       const msg = JSON.parse(data.toString()) as ServerMessage;
       if (msg.type === 'answer') resolve(msg.sdp);
+      if (msg.type === 'liveCalls') {
+        h.liveCalls = msg.calls;
+        callWaiters = callWaiters.filter((w) => (w.pred(msg.calls) ? (w.resolve(msg.calls), false) : true));
+      }
+      if (msg.type === 'error') {
+        h.errors.push(msg.message);
+        errorWaiters = errorWaiters.filter((w) => (w.pred(msg.message) ? (w.resolve(msg.message), false) : true));
+      }
       if (msg.type === 'status') {
         lastStatus = msg.status;
         statusWaiters = statusWaiters.filter((w) => (w.pred(msg.status) ? (w.resolve(msg.status), false) : true));

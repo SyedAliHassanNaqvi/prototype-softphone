@@ -6,8 +6,15 @@
 // One extension, one browser session, one call. A new browser tab that joins takes over the
 // session; a call in progress keeps running and its audio moves to the new tab once that tab's
 // WebRTC leg connects.
+//
+// Supervision (optional, needs AMI): the browser picks an agent from the live calls board, the
+// Supervisor makes the PBX ring our extension into ChanSpy, and this class auto-answers that
+// one call (recognised by its one-time token) so it plays like any other call. Mode switches
+// are DTMF on that call; takeover is AMI, after which it is an ordinary call with the customer.
+import crypto from 'node:crypto';
 import type { WebSocket } from 'ws';
-import type { ClientMessage, GatewayStatus, ServerMessage } from '../shared/protocol.ts';
+import type { ClientMessage, GatewayStatus, MonitorInfo, MonitorMode, ServerMessage, SupervisorStatus } from '../shared/protocol.ts';
+import { MONITOR_HEADER, type Supervisor } from './ami/Supervisor.ts';
 import { transcode } from './media/g711.ts';
 import type { MediaStats, SipUA } from './sip/SipUA.ts';
 import type { CodecName } from './sip/sdp.ts';
@@ -22,7 +29,19 @@ export interface MediaGatewayOptions {
   codecs: CodecName[];
   webrtcPortRange?: [number, number];
   stunServers?: string[];
+  /** Listen / whisper / takeover. Without it those features are reported as 'off'. */
+  supervisor?: Supervisor;
   log?: (line: string) => void;
+}
+
+interface MonitorSession {
+  info: MonitorInfo;
+  /** One-time caller ID number (and X-Arzen-Monitor value) of the spy call. */
+  token: string;
+  /** Mode to fall back to if a takeover fails. */
+  mode: MonitorMode;
+  /** Started with "Take over": take over as soon as the spy call is up. */
+  takeoverOnAnswer: boolean;
 }
 
 interface Session {
@@ -44,6 +63,9 @@ export class MediaGateway {
   /** Packets relayed on the browser leg during the current call. */
   private media = { fromBrowser: 0, toBrowser: 0 };
   private mediaTimer: NodeJS.Timeout | undefined;
+  private monitor: MonitorSession | null = null;
+  /** Spy calls given up on before the PBX rang us: decline them when they arrive. */
+  private cancelledTokens = new Set<string>();
 
   constructor(ua: SipUA, opts: MediaGatewayOptions) {
     this.ua = ua;
@@ -60,7 +82,12 @@ export class MediaGateway {
       this.log(`media: PBX audio comes from ${to.address}:${to.port} but its SDP said ${st?.sdpTarget}; sending there instead (symmetric RTP)`);
     });
     ua.on('call', (call) => {
+      if (call.state === 'incoming' && this.onMonitorInvite(call.number ?? '')) {
+        this.media = { fromBrowser: 0, toBrowser: 0 };
+        return;
+      }
       this.lastEndReason = call.state === 'idle' ? call.reason ?? '' : '';
+      this.onMonitorCallState(call.state, call.reason);
       if (call.state === 'calling' || call.state === 'incoming') this.media = { fromBrowser: 0, toBrowser: 0 };
       if (call.state === 'active' && !this.mediaTimer) this.mediaTimer = setInterval(() => this.logMedia(), MEDIA_LOG_MS);
       if (call.state === 'idle' && this.mediaTimer) {
@@ -85,6 +112,14 @@ export class MediaGateway {
       this.media.toBrowser++;
       peer.sendAudio(transcode(pkt.payload, codec, peer.codec), pkt);
     });
+
+    const sup = opts.supervisor;
+    if (sup) {
+      sup.on('state', () => this.pushStatus());
+      sup.on('calls', (calls) => {
+        if (this.session) this.send(this.session.ws, { type: 'liveCalls', calls });
+      });
+    }
 
     // Drop browsers that vanished without closing the socket (laptop lid, network change).
     this.heartbeat = setInterval(() => {
@@ -133,11 +168,156 @@ export class MediaGateway {
       },
       call: {
         ...call,
+        ...(this.monitor && call.state !== 'idle' ? this.monitorCallLabel(this.monitor.info) : {}),
         browserCodec: call.codec ? this.browserCodec : null,
         ...(call.state === 'idle' && this.lastEndReason ? { reason: this.lastEndReason } : {}),
       },
       peer: this.session?.peer?.state ?? 'new',
+      supervisor: this.supervisorStatus(),
     };
+  }
+
+  /** During supervision the PBX's caller ID is our token: show the people instead. */
+  private monitorCallLabel(info: MonitorInfo): { number: string; display: string } {
+    const { target } = info;
+    if (info.state === 'takenOver') return { number: target.peer.number, display: target.peer.name ?? '' };
+    return { number: target.extension, display: target.name ?? '' };
+  }
+
+  private supervisorStatus(): SupervisorStatus {
+    const sup = this.opts.supervisor;
+    const monitor = this.monitor?.info ?? null;
+    return sup ? { ...sup.state, monitor } : { state: 'off', monitor };
+  }
+
+  // ======================================================================================
+  // Supervision: listen / whisper / takeover
+  // ======================================================================================
+
+  /** Is this ringing call the PBX connecting our spy call? Answers (or declines) it if so. */
+  private onMonitorInvite(number: string): boolean {
+    const header = this.ua.incomingHeader(MONITOR_HEADER)?.trim();
+    const matches = (token: string): boolean => number === token || header === token;
+    const m = this.monitor;
+    if (m && m.info.state === 'connecting' && matches(m.token)) {
+      this.log(`monitor: PBX is connecting the spy call on ${m.info.target.channel}, answering`);
+      this.ua.answer(this.codecOrder()).catch((err: Error) => this.log(`monitor: answer failed: ${err.message}`));
+      return true;
+    }
+    for (const token of this.cancelledTokens) {
+      if (matches(token)) {
+        this.cancelledTokens.delete(token);
+        this.ua.reject(486, 'Busy Here', 'Monitoring was cancelled.');
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private onMonitorCallState(state: GatewayStatus['call']['state'], reason?: string): void {
+    const m = this.monitor;
+    if (!m) return;
+    if (state === 'active' && m.info.state === 'connecting') {
+      m.info.state = m.mode;
+      this.log(`monitor: ${m.mode} on ${m.info.target.extension} (${m.info.target.channel})`);
+      if (m.takeoverOnAnswer) this.takeover().catch((err: Error) => this.sendError(err.message));
+    } else if (state === 'idle') {
+      if (m.info.state !== 'takenOver') {
+        const ext = m.info.target.extension;
+        this.lastEndReason = reason === 'The other party hung up.' ? `Monitoring ended: ${ext}'s call finished.` : reason || 'Monitoring ended.';
+      }
+      this.log(`monitor: ended (${m.info.target.extension})`);
+      this.monitor = null;
+    }
+  }
+
+  private requireSupervisor(): Supervisor {
+    const sup = this.opts.supervisor;
+    if (!sup) throw new Error('Call supervision is not configured on the gateway (set AMI_USER and AMI_SECRET).');
+    if (sup.state.state !== 'connected') throw new Error(`Not connected to the PBX's AMI${sup.state.error ? `: ${sup.state.error}` : '.'}`);
+    return sup;
+  }
+
+  private async startMonitor(session: Session, channel: string, mode: MonitorMode | 'takeover'): Promise<void> {
+    const sup = this.requireSupervisor();
+    if (mode !== 'listen' && mode !== 'whisper' && mode !== 'takeover') throw new Error('Unknown monitoring mode.');
+    if (session.peer?.state !== 'connected') throw new Error('Browser audio is not connected yet.');
+    if (this.ua.registration.state !== 'registered') throw new Error('Not registered to the PBX.');
+    if (this.monitor || this.ua.callInfo.state !== 'idle') throw new Error('Finish the current call first.');
+
+    await sup.refresh();
+    const target = sup.calls.find((c) => c.channel === channel);
+    if (!target) throw new Error('That call has already ended.');
+    if (this.monitor || this.ua.callInfo.state !== 'idle') throw new Error('Finish the current call first.');
+
+    const token = `spy${crypto.randomBytes(4).toString('hex')}`;
+    const m: MonitorSession = {
+      info: { state: 'connecting', target },
+      token,
+      mode: mode === 'whisper' ? 'whisper' : 'listen',
+      takeoverOnAnswer: mode === 'takeover',
+    };
+    this.monitor = m;
+    this.lastEndReason = '';
+    this.log(`monitor: ${mode} ${target.extension} (${target.channel}) requested`);
+    this.pushStatus();
+
+    sup.spy(target, { whisper: m.mode === 'whisper', token }).catch((err: Error) => {
+      // A late failure after the spy call is up (or after we gave up) changes nothing.
+      if (this.monitor !== m || m.info.state !== 'connecting' || this.ua.callInfo.state !== 'idle') return;
+      this.log(`monitor: ${err.message}`);
+      this.monitor = null;
+      this.sendError(err.message);
+      this.pushStatus();
+    });
+  }
+
+  /** Give up on a spy call the PBX hasn't rung us with yet. */
+  private cancelPendingMonitor(): boolean {
+    const m = this.monitor;
+    if (!m || m.info.state !== 'connecting' || this.ua.callInfo.state !== 'idle') return false;
+    this.monitor = null;
+    this.cancelledTokens.add(m.token);
+    setTimeout(() => this.cancelledTokens.delete(m.token), 30000).unref();
+    this.log('monitor: cancelled before the PBX connected it');
+    this.pushStatus();
+    return true;
+  }
+
+  private setMonitorMode(mode: MonitorMode): void {
+    const m = this.monitor;
+    if (!m || (m.info.state !== 'listen' && m.info.state !== 'whisper')) throw new Error('Not monitoring a call.');
+    if (mode !== 'listen' && mode !== 'whisper') throw new Error('Unknown monitoring mode.');
+    if (m.info.state === mode) return;
+    // ChanSpy's d option: 4 = listen only, 5 = whisper to the spied-on channel (the agent).
+    this.ua.sendDtmf(mode === 'listen' ? '4' : '5');
+    m.info.state = mode;
+    m.mode = mode;
+    this.log(`monitor: switched to ${mode}`);
+    this.pushStatus();
+  }
+
+  private async takeover(): Promise<void> {
+    const m = this.monitor;
+    if (!m || (m.info.state !== 'listen' && m.info.state !== 'whisper')) throw new Error('Not monitoring a call.');
+    const sup = this.requireSupervisor();
+    m.info.state = 'takingOver';
+    this.pushStatus();
+    try {
+      const peer = await sup.takeover(m.info.target);
+      if (this.monitor !== m) return;
+      m.info = { state: 'takenOver', target: { ...m.info.target, peer } };
+      this.log(`monitor: took over ${m.info.target.extension}'s call with ${peer.number || peer.channel}`);
+    } catch (err) {
+      if (this.monitor === m && m.info.state === 'takingOver') m.info.state = m.mode;
+      throw err;
+    } finally {
+      this.pushStatus();
+    }
+  }
+
+  private sendError(message: string): void {
+    if (this.session) this.send(this.session.ws, { type: 'error', message });
   }
 
   private send(ws: WebSocket, msg: ServerMessage): void {
@@ -172,6 +352,7 @@ export class MediaGateway {
       void this.session.peer?.close();
       this.session = null;
       // Without a browser nobody can hear the call.
+      this.cancelPendingMonitor();
       this.ua.hangup('Browser disconnected.');
     });
   }
@@ -187,6 +368,7 @@ export class MediaGateway {
       this.session = { ws, peer: null, alive: true };
       this.log('browser joined');
       this.pushStatus();
+      if (this.opts.supervisor) this.send(ws, { type: 'liveCalls', calls: this.opts.supervisor.calls });
       return;
     }
 
@@ -228,6 +410,7 @@ export class MediaGateway {
         return;
       }
       case 'hangup':
+        if (this.cancelPendingMonitor()) return;
         this.ua.hangup();
         return;
       case 'accept':
@@ -240,8 +423,20 @@ export class MediaGateway {
       case 'mute':
         this.ua.setMute(Boolean(msg.muted));
         return;
-      case 'dtmf':
-        if (/^[0-9*#A-D]$/i.test(msg.digit)) this.ua.sendDtmf(msg.digit);
+      case 'dtmf': {
+        // While spying, digits drive ChanSpy (4/5/6, * = next channel): only monitorMode sends them.
+        const spying = this.monitor && this.monitor.info.state !== 'takenOver';
+        if (!spying && /^[0-9*#A-D]$/i.test(msg.digit)) this.ua.sendDtmf(msg.digit);
+        return;
+      }
+      case 'monitor':
+        await this.startMonitor(session, String(msg.channel ?? ''), msg.mode);
+        return;
+      case 'monitorMode':
+        this.setMonitorMode(msg.mode);
+        return;
+      case 'takeover':
+        await this.takeover();
         return;
       default:
         throw new Error(`Unknown message type ${(msg as { type: string }).type}`);

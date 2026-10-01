@@ -999,6 +999,12 @@ export class SipUA extends EventEmitter<{
     this.emitCall();
   }
 
+  /** A header of the ringing inbound call's INVITE (e.g. to recognise a supervision call). */
+  incomingHeader(name: string): string | undefined {
+    const req = this.call?.state === 'incoming' ? this.call.inviteReq : undefined;
+    return req ? getHeader(req, name) : undefined;
+  }
+
   /** Decline the ringing inbound call (486 Busy Here by default). */
   reject(status = 486, reason = 'Busy Here', why = ''): void {
     const call = this.call;

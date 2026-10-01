@@ -65,17 +65,19 @@ Everything is TypeScript. See README.md for setup, config and architecture.
 - Modes: `PBX_TRANSPORT=udp|tls`, `PBX_ENCRYPTION` (SRTP, defaults to on with tls). Encrypted mode is strict: no fallback to plain RTP.
 - `server/webrtc/BrowserPeer.ts`: werift peer. It offers the browser ONE G.711 law (`SIP_CODECS[0]`), so payloads pass through untouched. No Opus.
 - `shared/protocol.ts`: WS message types for both sides. `web/`: Vite + React (`App.tsx`, `useWebRTC.ts`).
+- Supervision (listen / whisper / takeover), optional, enabled by `AMI_USER`/`AMI_SECRET`. `server/ami/`: `AmiClient.ts` (hand-written AMI over TCP 5038), `channels.ts` (pure: CoreShowChannels → `LiveCall[]`), `Supervisor.ts` (live-calls polling + event-triggered refresh, Originate ChanSpy, takeover = AMI `Bridge` customer↔our spy channel + `Hangup` agent). `MediaGateway` auto-answers the spy INVITE by its one-time token (caller ID number `spy<hex>`, or `X-Arzen-Monitor`). Listen/whisper switching is DTMF 4/5 (ChanSpy `d` option); keypad DTMF is blocked while spying. Always spy on the AGENT's full channel name (whisper must reach only the agent; ChanSpy matches by prefix).
 
 ### Commands
 - `npm run dev`: `node --watch server/gateway.ts` + Vite (127.0.0.1:5173, proxies `/ws` and `/api` to GATEWAY_PORT).
 - `npm start`: build to `dist/` and run `dist/server/gateway.js` (serves `dist/web` from the cwd).
-- `npm test`: `node --test "test/*.test.ts"`, with unit tests + werift "browser" ⇄ gateway ⇄ fake PBX over real UDP.
+- `npm test`: `node --test "test/*.test.ts"`, with unit tests + werift "browser" ⇄ gateway ⇄ fake PBX over real UDP. `test/fakeAmi.ts` is a scripted AMI server for the supervision tests.
 - `npm run typecheck`: server + tests (`tsconfig.test.json`) + web.
 - The TLS tests use `test/fixtures/pbx-cert.pem` (self-signed, SAN pbx.test/localhost/127.0.0.1, valid to 2126). The fake PBX does SRTP with werift's `SrtpSession` so the tests check interoperability.
 
 ### Rules / gotchas
 - The server runs `.ts` directly with Node type stripping. Use `.ts` extensions in relative imports, `import type` for types, and no enums, namespaces or parameter properties (`erasableSyntaxOnly`). `tsc` rewrites the extensions to `.js` for `dist/`.
-- Never auto-retry REGISTER after 401/403. Issabel's fail2ban bans the IP. Don't point tests or experiments at the real PBX with a wrong secret. TLS reconnects re-REGISTER only while `authRejected` is false.
+- Never auto-retry REGISTER after 401/403. Issabel's fail2ban bans the IP. Don't point tests or experiments at the real PBX with a wrong secret. TLS reconnects re-REGISTER only while `authRejected` is false. The same applies to AMI logins (`AmiClient.authRejected`).
+- Keep `server/ami` free of werift/express/the SIP stack: it is meant to move into the PMS backend (which already has an AMI connection) during integration.
 - Regex-heavy edits through shell heredocs / `node -e` lose backslashes. Use the Edit tool or a script file.
 - One call at a time. All SIP requests go to the PBX as the outbound proxy (no DNS SRV, no NAT traversal beyond `rport`).
 - Keep `server/sip` and `server/media` free of werift/express so they stay unit-testable.

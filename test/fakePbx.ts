@@ -241,12 +241,12 @@ export async function startFakePbx({ transport = 'udp', srtp = false }: FakePbxO
 }
 
 /** An inbound INVITE from the PBX towards the UA at `uaPort`. */
-export function inboundInvite(pbx: FakePbx, uaPort: number, callId: string, transport: 'UDP' | 'TLS' = 'UDP'): string {
+export function inboundInvite(pbx: FakePbx, uaPort: number, callId: string, transport: 'UDP' | 'TLS' = 'UDP', from = '"Front Desk" <sip:1002@127.0.0.1>'): string {
   return buildMessage({
     startLine: `INVITE sip:1001@127.0.0.1:${uaPort} SIP/2.0`,
     headers: [
       ['Via', `SIP/2.0/${transport} 127.0.0.1:${pbx.port};branch=z9hG4bK${callId};rport`],
-      ['From', `"Front Desk" <sip:1002@127.0.0.1>;tag=from${callId}`],
+      ['From', `${from};tag=from${callId}`],
       ['To', '<sip:1001@127.0.0.1>'],
       ['Call-ID', callId],
       ['CSeq', '102 INVITE'],

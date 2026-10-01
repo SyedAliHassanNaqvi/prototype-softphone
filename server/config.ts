@@ -27,8 +27,21 @@ export interface GatewayConfig {
   webrtcPortRange?: [number, number];
   stunServers: string[];
   logSip: boolean;
+  /** Call supervision (listen / whisper / takeover) over AMI. Unset when AMI_USER is empty. */
+  ami?: AmiConfig;
   /** Non-fatal configuration problems to print at startup. */
   warnings: string[];
+}
+
+export interface AmiConfig {
+  host: string;
+  port: number;
+  username: string;
+  secret: string;
+  /** Channel ChanSpy rings for us, e.g. "SIP/109". Default: the agent's technology + our extension. */
+  spyChannel?: string;
+  /** Channel peer names that are agent extensions rather than trunks. */
+  agentPattern: RegExp;
 }
 
 const bool = (raw: string | undefined, fallback: boolean): boolean =>
@@ -103,6 +116,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
   const pbxPort = env.PBX_PORT ? int(env, 'PBX_PORT', 5060) : uriPort ?? (transport === 'tls' ? 5061 : 5060);
   if (transport === 'tls' && pbxPort === 5060) warnings.push('PBX_TRANSPORT=tls with PBX_PORT=5060: Asterisk listens for TLS on 5061 by default.');
 
+  // Supervision is optional: without an AMI user the softphone works as before.
+  let ami: AmiConfig | undefined;
+  const amiUser = env.AMI_USER || env.AMI_USERNAME;
+  const amiSecret = env.AMI_SECRET || env.AMI_PASSWORD;
+  if (amiUser) {
+    if (!amiSecret) throw new Error('AMI_USER is set but AMI_SECRET is missing.');
+    let agentPattern: RegExp;
+    try {
+      agentPattern = new RegExp(env.AMI_AGENT_PATTERN || '^\\d{2,6}$');
+    } catch (err) {
+      throw new Error(`AMI_AGENT_PATTERN is not a valid regular expression: ${(err as Error).message}`);
+    }
+    const spyChannel = env.AMI_SPY_CHANNEL || undefined;
+    if (spyChannel && !/^[A-Za-z0-9]+\/[^\s,]+$/.test(spyChannel)) throw new Error(`AMI_SPY_CHANNEL must look like SIP/109 or PJSIP/109, got "${spyChannel}"`);
+    ami = { host: env.AMI_HOST || pbxIp!, port: int(env, 'AMI_PORT', 5038), username: amiUser, secret: amiSecret, spyChannel, agentPattern };
+  }
+
   const wMin = int(env, 'WEBRTC_PORT_MIN', 0);
   const wMax = int(env, 'WEBRTC_PORT_MAX', 0);
 
@@ -126,6 +156,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     webrtcPortRange: wMin && wMax > wMin ? [wMin, wMax] : undefined,
     stunServers: (env.STUN_SERVERS || '').split(',').map((s) => s.trim()).filter(Boolean),
     logSip: bool(env.LOG_SIP, false),
+    ami,
     warnings,
   };
 }

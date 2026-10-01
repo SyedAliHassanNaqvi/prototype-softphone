@@ -7,6 +7,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { loadConfig } from './config.ts';
 import { MediaGateway } from './MediaGateway.ts';
+import { Supervisor } from './ami/Supervisor.ts';
 import { SipUA } from './sip/SipUA.ts';
 
 const ts = (): string => new Date().toISOString().slice(11, 23);
@@ -23,7 +24,10 @@ try {
 const ua = new SipUA();
 const pbx = `${config.pbxIp}:${config.pbxPort}`;
 for (const w of config.warnings) console.warn(`${ts()} WARNING ${w}`);
+const supervisor = config.ami ? new Supervisor({ ...config.ami, extension: config.extension, log }) : undefined;
+if (!supervisor) log('call supervision (listen / whisper / takeover) is off: set AMI_USER and AMI_SECRET to enable it');
 const gateway = new MediaGateway(ua, {
+  supervisor,
   extension: config.extension,
   pbx,
   transport: config.transport,
@@ -42,6 +46,9 @@ if (config.logSip) {
 const app = express();
 app.get('/api/status', (_req, res) => {
   res.json(gateway.status());
+});
+app.get('/api/calls', (_req, res) => {
+  res.json(supervisor?.calls ?? []);
 });
 const webDir = path.resolve(process.cwd(), 'dist/web');
 if (fs.existsSync(webDir)) {
@@ -74,6 +81,7 @@ server.listen(config.gatewayPort, config.gatewayHost, () => {
     rtpPortMin: config.rtpPortMin,
     rtpPortMax: config.rtpPortMax,
   }).then(() => log(`SIP ${config.transport.toUpperCase()} ${ua.localIp}:${ua.localPort} -> ${pbx}, media ${config.encryption ? 'SRTP' : 'plain RTP'}`));
+  supervisor?.start();
 });
 
 let stopping = false;
@@ -82,6 +90,7 @@ async function shutdown(): Promise<void> {
   stopping = true;
   log('shutting down (un-registering)...');
   await gateway.close();
+  await supervisor?.stop();
   await ua.stop();
   wss.close();
   server.close();

@@ -59,6 +59,10 @@ npm start                   # builds to dist/ and serves UI + /ws on http://127.
 | `WEBRTC_PORT_MIN` / `WEBRTC_PORT_MAX` | any | Optional fixed UDP range for the browser's ICE/media (for firewalls) |
 | `STUN_SERVERS` | none | Comma-separated `stun:` URLs. Only needed if browser and gateway are not on the same LAN |
 | `LOG_SIP` | `0` | `1` prints every SIP message (in encrypted mode this includes the SRTP keys) |
+| `AMI_USER` / `AMI_SECRET` | – | AMI login for [call supervision](#call-supervision-listen-whisper-takeover). Empty = feature off. `AMI_USERNAME` / `AMI_PASSWORD` also work |
+| `AMI_HOST` / `AMI_PORT` | `PBX_IP` / `5038` | Asterisk Manager Interface address |
+| `AMI_SPY_CHANNEL` | agent's tech + `SIP_EXTENSION` | Channel the PBX rings for a spy call, e.g. `SIP/109` or `PJSIP/109` |
+| `AMI_AGENT_PATTERN` | `^\d{2,6}$` | Regex for channel peer names that are agent extensions (anything else, like a trunk, is "the other party") |
 
 ### Issabel extension settings (plain mode)
 
@@ -146,6 +150,57 @@ Common failures, shown in the UI and log:
 | `PBX … answered plain RTP but PBX_ENCRYPTION is on` | `encryption=yes` (chan_sip) / `media_encryption=sdes` (PJSIP) on the extension |
 | `The PBX requires SRTP: set PBX_ENCRYPTION=true` | The extension has encryption on but the gateway doesn't |
 
+## Call supervision (listen, whisper, takeover)
+
+With `AMI_USER` / `AMI_SECRET` set, the UI shows a **Live calls** board next to the phone: every extension that is in a two-party call on the PBX, the other party, the call time, and who is already monitoring it. Each row has three buttons:
+
+| Button | What happens | Supervisor hears | Who hears the supervisor |
+|---|---|---|---|
+| **Listen** | `ChanSpy(<agent channel>,qEd)` | Both sides | Nobody |
+| **Whisper** | `ChanSpy(<agent channel>,qEdw)` | Both sides | Only the agent. The customer hears nothing |
+| **Take over** | Listen, then AMI `Bridge` + `Hangup` | The customer | The customer. The agent is dropped |
+
+How it works:
+
+1. The gateway sends AMI `Originate` that rings **its own extension** (`SIP/<SIP_EXTENSION>`) with `ChanSpy` on the agent's **full** channel name (`SIP/115-0000001a`). ChanSpy matches by prefix, so a bare `SIP/11` would also catch 115. The caller ID number of that call is a one-time token (`spy1a2b3c4d`). chan_sip also gets an `X-Arzen-Monitor` header.
+2. The gateway recognises the token on the incoming INVITE and answers it automatically. It is then a normal call to the browser, with the same audio path, mute and timer.
+3. **Listen ⇄ Whisper** during the session sends DTMF **4** / **5** (RFC 4733) on that call. ChanSpy's `d` option switches modes without redialing. Whisper always targets the agent's channel, which is why only the agent hears it. While spying, the keypad is locked because its digits would drive ChanSpy (`*` jumps to another channel).
+4. **Take over** finds our ChanSpy channel in `CoreShowChannels` and sends `Bridge Channel1=<customer channel> Channel2=<our spy channel>`. Asterisk moves the customer out of the agent's bridge into a new one with us, and the agent's bridge dissolves. A `Hangup` on the agent's channel makes sure. Our SIP call stays up and now carries the customer. **Take over** on the board does both steps in one go.
+5. **Leave** hangs up the spy call. If the agent's call ends, ChanSpy (`E` option) hangs up on us and the UI says so.
+
+The board is built from `CoreShowChannels` (Asterisk 12+ `BridgeId`, with the Asterisk 11 `BridgedChannel` as a fallback). It refreshes on AMI call events (at most once a second) and every 5 s, and is also served as JSON at `/api/calls`. A wrong AMI secret is tried **once** and never retried, the same rule as REGISTER, because Issabel's fail2ban also counts AMI login failures.
+
+### Issabel / Asterisk settings for supervision
+
+1. **An AMI user that may originate and bridge.** In `/etc/asterisk/manager_custom.conf`, not `manager.conf`, which Issabel rewrites:
+
+   ```ini
+   [arzen]
+   secret = <strong secret>
+   deny = 0.0.0.0/0.0.0.0
+   permit = 192.168.200.20/255.255.255.255   ; the gateway PC
+   read = call
+   write = originate,call,reporting
+   ```
+
+   Then run `asterisk -rx "manager reload"`. Here is what each class is for:
+
+   | Class | Line | Used for |
+   |---|---|---|
+   | `call` | read | Call events that refresh the board (Newstate, Hangup, BridgeEnter/Leave...) and OriginateResponse |
+   | `originate` | write | `Originate`, which rings our extension into ChanSpy |
+   | `call` | write | `Bridge` and `Hangup` for takeover |
+   | `reporting` | write | `CoreShowChannels`, which builds the board. Asterisk accepts `system` or `reporting` here, and `reporting` is the safer one |
+
+   Other read classes (`agent`, `user`, `cdr`, `system`...) aren't used. If the PMS backend's `arzen` AMI user is shared, keep its existing `read` line (its dial monitor needs `call` events), add `originate,call,reporting` to `write`, and add the gateway's IP to its `permit` lines. Or create a separate user for the gateway. Check with `asterisk -rx "manager show user arzen"`. `enabled = yes` must be set under `[general]`, and it is on Issabel by default.
+2. **ChanSpy is loaded.** `asterisk -rx "module show like chanspy"` should list `app_chanspy.so`.
+3. **The gateway's extension (e.g. 109)** uses `dtmfmode=rfc2833`, or `auto`, so the 4/5 mode switches reach ChanSpy. It allows `alaw`/`ulaw`. Call waiting doesn't matter, because the gateway only starts monitoring when it is idle.
+4. **Firewall / fail2ban.** Allow TCP **5038** from the gateway to the PBX. Add the gateway's IP to fail2ban's `ignoreip` so a mistyped secret during setup can't lock it out.
+5. **Recommended: restrict feature code 555 (ChanSpy)** under PBX → Feature Codes. Otherwise any phone can listen in without going through this UI.
+6. **Agents' extensions need no changes.** ChanSpy works on their channels whether they use a desk phone, X-Lite or this softphone.
+
+Check it: `asterisk -rx "core show channels"` during an agent's call shows names like `SIP/115-0000001a`. If agents use PJSIP, the default `AMI_SPY_CHANNEL` follows (`PJSIP/109`).
+
 ## How the media works
 
 - **Codec strategy: G.711 passthrough.** The gateway offers the browser only one G.711 law. Every browser supports PCMU/PCMA in WebRTC. Each 20 ms RTP payload from the browser is therefore already a frame Asterisk understands, and the gateway just rewrites the RTP header (SSRC, sequence, timestamp) and forwards it. No decoding, no jitter buffer, no extra delay. Opus is left out on purpose because it would need a full decode and re-encode per packet.
@@ -164,7 +219,8 @@ Types are in [`shared/protocol.ts`](shared/protocol.ts).
 | `join` | `status` (registration, call, WebRTC state: full snapshot on every change) |
 | `offer {sdp}`, `candidate {candidate}` | `answer {sdp}` (includes the gateway's ICE candidates) |
 | `dial {number}`, `hangup`, `accept`, `reject` | `error {message}` |
-| `mute {muted}`, `dtmf {digit}` | |
+| `mute {muted}`, `dtmf {digit}` | `liveCalls {calls}` (supervision board, on join and on change) |
+| `monitor {channel, mode: listen\|whisper\|takeover}`, `monitorMode {mode}`, `takeover` | `status.supervisor` carries the AMI state and the monitoring session |
 
 There is one browser session per gateway. A second tab takes over the session, and a call in progress continues in the new tab. Inbound calls ring in the browser. If no browser is connected, the gateway answers `480 Temporarily Unavailable` so Asterisk can fall through to voicemail.
 
@@ -189,6 +245,8 @@ server/
                       message parser, MD5 digest, SDP (incl. SDES a=crypto)
   media/              RtpEndpoint (RTP/SRTP towards Asterisk, RFC 4733), srtp.ts (RFC 3711),
                       rtp helpers, G.711 tables
+  ami/                AmiClient (AMI over TCP), channels.ts (live calls from CoreShowChannels),
+                      Supervisor (board, Originate ChanSpy, takeover via Bridge + Hangup)
   webrtc/BrowserPeer.ts  werift peer connection for the browser leg
 shared/protocol.ts    WebSocket message types (used by both sides)
 web/                  Vite + React app (App.tsx, useWebRTC.ts)
@@ -197,7 +255,8 @@ test/                 node --test suites, harness, fake PBX (UDP/TLS, SRTP via w
 
 ## Limits of this MVP
 
-- One extension, one call at a time. No hold, transfer or conference.
+- One extension, one call at a time. No hold, transfer or conference. A monitoring session counts as the call.
+- Supervision has no roles or permissions yet: anyone who can open the gateway can listen to every call on the PBX. Keep `GATEWAY_HOST=127.0.0.1` until the PMS integration adds login and per-team checks.
 - The browser must reach the gateway over UDP (same LAN, or open `WEBRTC_PORT_*`). No TURN.
 - `getUserMedia` needs a secure context. `localhost` / `127.0.0.1` is fine. To use it from another PC, put the gateway behind HTTPS, for example with a reverse proxy, and set `GATEWAY_HOST=0.0.0.0`. Anyone who can reach the gateway can call on its extension, so keep it private or add auth.
 - Encrypted mode supports AES_CM_128_HMAC_SHA1_80 only: no MKI, no AES-256/GCM suites, no SRTCP (RTCP isn't used). TLS must be to the PBX directly (no outbound proxy), and the PBX must be able to reach the gateway's connection. That means no double NAT unless Asterisk uses `nat=force_rport`.

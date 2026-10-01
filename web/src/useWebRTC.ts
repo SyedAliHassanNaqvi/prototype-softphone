@@ -10,7 +10,7 @@
 // party. When a microphone appears later (devicechange) it replaces the silent track in place,
 // and if the mic is unplugged mid-call the silent track takes over again.
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ClientMessage, GatewayStatus, ServerMessage } from '../../shared/protocol.ts';
+import type { ClientMessage, GatewayStatus, LiveCall, MonitorMode, ServerMessage } from '../../shared/protocol.ts';
 
 export type LinkState = 'mic' | 'connecting' | 'online' | 'offline' | 'replaced';
 
@@ -60,6 +60,7 @@ export function useWebRTC() {
   const [micError, setMicError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
+  const [liveCalls, setLiveCalls] = useState<LiveCall[]>([]);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -192,6 +193,8 @@ export function useWebRTC() {
         if (msg.type === 'status') {
           setStatus(msg.status);
           if (msg.status.call.state === 'idle' && mutedRef.current) applyMute(false); // mute is per call
+        } else if (msg.type === 'liveCalls') {
+          setLiveCalls(msg.calls);
         } else if (msg.type === 'answer') {
           pc?.setRemoteDescription({ type: 'answer', sdp: msg.sdp }).catch((err: Error) => setError(`WebRTC: ${err.message}`));
         } else if (msg.type === 'error') {
@@ -202,6 +205,7 @@ export function useWebRTC() {
         if (wsRef.current === ws) wsRef.current = null;
         teardownPeer();
         setStatus(null);
+        setLiveCalls([]);
         if (disposed) return;
         if (ev.code === 4001) {
           setLink('replaced'); // another tab took over; don't fight it
@@ -265,7 +269,23 @@ export function useWebRTC() {
 
   const sendDtmf = useCallback((digit: string) => send({ type: 'dtmf', digit }), [send]);
 
+  // Supervision: listen / whisper / takeover on an agent's live call.
+  const monitor = useCallback(
+    (channel: string, mode: MonitorMode | 'takeover') => {
+      unlockAudio();
+      setError(null);
+      send({ type: 'monitor', channel, mode });
+    },
+    [send],
+  );
+  const setMonitorMode = useCallback((mode: MonitorMode) => send({ type: 'monitorMode', mode }), [send]);
+  const takeover = useCallback(() => send({ type: 'takeover' }), [send]);
+
   const reconnect = useCallback(() => location.reload(), []);
 
-  return { status, link, micError, error, muted, audioRef, dial, hangup, accept, reject, toggleMute, sendDtmf, reconnect, clearError: () => setError(null) };
+  return {
+    status, link, micError, error, muted, liveCalls, audioRef,
+    dial, hangup, accept, reject, toggleMute, sendDtmf, monitor, setMonitorMode, takeover, reconnect,
+    clearError: () => setError(null),
+  };
 }
